@@ -5,6 +5,12 @@ const staff = require('./staff');
 const app = express();
 const PORT = 3000;
 
+// MIDDLEWARE - 
+app.use(express.json());
+
+// In-memory storage 
+const bookings = [];
+
 app.get('/', (req, res) => {
   res.send('Hello from CrossCut Salon Backend!');
 });
@@ -37,6 +43,33 @@ app.get('/staff/:id', (req, res) => {
   }
 
   res.json(member);
+});
+
+// POST route - 
+app.post('/bookings', (req, res) => {
+  const { name, phone, service, date, time } = req.body;
+
+  if (!name || !phone || !service || !date || !time) {
+    return res.status(400).json({ message: 'Missing required fields' });
+  }
+
+  const newBooking = {
+    id: bookings.length + 1,
+    name,
+    phone,
+    service,
+    date,
+    time,
+  };
+
+  bookings.push(newBooking);
+
+  res.status(201).json(newBooking);
+});
+
+// GET route - 
+app.get('/bookings', (req, res) => {
+  res.json(bookings);
 });
 
 app.listen(PORT, () => {
