@@ -14,10 +14,20 @@ mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log('Connected to MongoDB!'))
   .catch((err) => console.error('MongoDB connection error:', err));
 
+// I-connect sa Postgres (POS)
+const pgPool = require('./db/pg');
+pgPool.query('SELECT NOW()')
+  .then(() => console.log('Connected to Supabase Postgres!'))
+  .catch((err) => console.error('Postgres connection error:', err));
+
 // Totoong services at staff data mula sa /data folder
 const services = require('./data/services');
 const staff = require('./data/staff');
 const Booking = require('./models/Booking');
+
+// POS routes (Postgres)
+const posRoutes = require('./routes/pos');
+app.use('/pos', posRoutes);
 
 // GET home route
 app.get('/', (req, res) => {
