@@ -95,24 +95,40 @@ router.get('/customers/:id', async (req, res) => {
   }
 });
 
-// UPSERT customer: gagawa kung wala pa, mag-uupdate kung meron na.
-// Hindi nito binubura ang dating name/phone kapag walang bagong value na ipinadala.
+// UPSERT customer: isinusulat lang ang mga field na NAKASAMA sa request body
+// (kahit blangko = binubura). Ang field na wala sa body ay hindi ginagalaw.
 router.post('/customers', async (req, res) => {
   try {
-    const { id, name, phone } = req.body;
+    const body = req.body || {};
+    const { id } = body;
 
     if (!id) {
       return res.status(400).json({ message: 'id is required' });
     }
 
+    const fields = ['name', 'phone', 'email', 'facebook', 'notes'];
+    const has = {};
+    const val = {};
+    fields.forEach((f) => {
+      has[f] = Object.prototype.hasOwnProperty.call(body, f);
+      const v = has[f] && body[f] != null ? String(body[f]).trim() : '';
+      val[f] = v === '' ? null : v;
+    });
+
     const result = await pool.query(
-      `INSERT INTO customers (id, name, phone)
-       VALUES ($1, $2, $3)
+      `INSERT INTO customers (id, name, phone, email, facebook, notes)
+       VALUES ($1, $2, $3, $4, $5, $6)
        ON CONFLICT (id) DO UPDATE SET
-         name  = COALESCE(EXCLUDED.name,  customers.name),
-         phone = COALESCE(EXCLUDED.phone, customers.phone)
+         name     = CASE WHEN $7  THEN EXCLUDED.name     ELSE customers.name     END,
+         phone    = CASE WHEN $8  THEN EXCLUDED.phone    ELSE customers.phone    END,
+         email    = CASE WHEN $9  THEN EXCLUDED.email    ELSE customers.email    END,
+         facebook = CASE WHEN $10 THEN EXCLUDED.facebook ELSE customers.facebook END,
+         notes    = CASE WHEN $11 THEN EXCLUDED.notes    ELSE customers.notes    END
        RETURNING *`,
-      [id, name || null, phone || null]
+      [
+        id, val.name, val.phone, val.email, val.facebook, val.notes,
+        has.name, has.phone, has.email, has.facebook, has.notes,
+      ]
     );
 
     res.status(201).json(result.rows[0]);
@@ -123,7 +139,8 @@ router.post('/customers', async (req, res) => {
 
 /* ---------------- SALES ---------------- */
 
-// Kasama na ang customer_name mula sa customers table (LEFT JOIN)
+// Kasama na ang customer_name at customer_phone mula sa customers table (LEFT JOIN).
+// Sadyang hindi isinama dito ang email/facebook/notes.
 router.get('/sales', async (req, res) => {
   try {
     const result = await pool.query(
@@ -171,7 +188,7 @@ router.post('/sales', async (req, res) => {
     }
 
     // Siguraduhing may row sa customers para sa customerId (hindi nito
-    // ino-overwrite ang existing na name/phone)
+    // ino-overwrite ang existing na data)
     if (customerId) {
       await pool.query(
         'INSERT INTO customers (id) VALUES ($1) ON CONFLICT (id) DO NOTHING',
