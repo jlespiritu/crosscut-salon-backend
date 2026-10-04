@@ -83,6 +83,42 @@ router.get('/customers', async (req, res) => {
   }
 });
 
+// ---- Listahan ng posibleng DUPLICATE na customers (read-only, walang binabago) ----
+// Dapat nasa ibabaw ng '/customers/:id' para hindi mapagkamalang id ang "duplicates".
+const normName = (v) => String(v || '').toLowerCase().replace(/\s+/g, ' ').trim();
+const normPhone = (v) => {
+  const d = String(v || '').replace(/\D/g, '');
+  return d.length >= 10 ? d.slice(-10) : '';   // 0917.. / 917.. / +63917.. = pareho
+};
+
+router.get('/customers/duplicates', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT c.id, c.name, c.phone, c.email, c.created_at, count(s.id)::int AS sales_count
+       FROM customers c
+       LEFT JOIN sales s ON s.customer_id = c.id
+       GROUP BY c.id, c.name, c.phone, c.email, c.created_at
+       ORDER BY c.created_at`
+    );
+    const group = (keyFn) => {
+      const m = new Map();
+      rows.forEach((r) => {
+        const k = keyFn(r);
+        if (!k) return;
+        if (!m.has(k)) m.set(k, []);
+        m.get(k).push(r);
+      });
+      return [...m.values()].filter((g) => g.length > 1);
+    };
+    res.json({
+      byName: group((r) => normName(r.name)),
+      byPhone: group((r) => normPhone(r.phone)),
+    });
+  } catch (err) {
+    res.status(500).json({ message: 'Error finding duplicates', error: err.message });
+  }
+});
+
 router.get('/customers/:id', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM customers WHERE id = $1', [req.params.id]);
@@ -137,6 +173,102 @@ router.post('/customers', async (req, res) => {
   }
 });
 
+// MERGE: pagsamahin ang mga duplicate na customer sa ISANG record.
+// Body: { "keepId": "cust_...", "mergeIds": ["cust_...", "cust_..."] }
+// Lahat ng benta ng mergeIds ay ililipat sa keepId, ang blangkong field ng keepId
+// (phone, email, facebook, notes) ay pupunuan mula sa mga kopya, tapos buburahin ang mga kopya.
+// Isang transaction ito: kung may pumalya, walang mababago.
+router.post('/customers/merge', async (req, res) => {
+  const { keepId, mergeIds } = req.body || {};
+  if (!keepId || !Array.isArray(mergeIds) || mergeIds.length === 0) {
+    return res.status(400).json({ message: 'keepId and a non-empty mergeIds array are required' });
+  }
+  const ids = [...new Set(mergeIds.map(String))].filter((x) => x !== String(keepId));
+  if (ids.length === 0) {
+    return res.status(400).json({ message: 'mergeIds must contain ids other than keepId' });
+  }
+
+  const ph = ids.map((_, i) => '$' + (i + 1)).join(',');   // $1,$2,... para sa IN (...)
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const keepRes = await client.query('SELECT * FROM customers WHERE id = $1', [keepId]);
+    if (keepRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'keepId not found' });
+    }
+    const keep = keepRes.rows[0];
+
+    const dupRes = await client.query(
+      `SELECT * FROM customers WHERE id IN (${ph}) ORDER BY created_at`,
+      ids
+    );
+    if (dupRes.rows.length !== ids.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'One or more mergeIds were not found' });
+    }
+
+    const fill = {};
+    ['phone', 'email', 'facebook', 'notes'].forEach((f) => {
+      if (!keep[f] || !String(keep[f]).trim()) {
+        const donor = dupRes.rows.find((d) => d[f] && String(d[f]).trim());
+        if (donor) fill[f] = donor[f];
+      }
+    });
+    // Kung mas maaga ang pagkakagawa ng kopya, iyon ang gawing created_at
+    let earliest = keep.created_at;
+    dupRes.rows.forEach((d) => {
+      if (d.created_at && (!earliest || new Date(d.created_at) < new Date(earliest))) earliest = d.created_at;
+    });
+
+    const moved = await client.query(
+      `UPDATE sales SET customer_id = $1 WHERE customer_id IN (${ids.map((_, i) => '$' + (i + 2)).join(',')})`,
+      [keepId, ...ids]
+    );
+    await client.query(
+      `UPDATE customers SET
+         phone = COALESCE($2, phone), email = COALESCE($3, email),
+         facebook = COALESCE($4, facebook), notes = COALESCE($5, notes),
+         created_at = $6
+       WHERE id = $1`,
+      [keepId, fill.phone || null, fill.email || null, fill.facebook || null, fill.notes || null, earliest]
+    );
+    const del = await client.query(`DELETE FROM customers WHERE id IN (${ph})`, ids);
+
+    await client.query('COMMIT');
+    res.json({
+      kept: keepId,
+      salesMoved: moved.rowCount,
+      customersDeleted: del.rowCount,
+      fieldsFilled: Object.keys(fill),
+    });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (_) { /* ignore */ }
+    res.status(500).json({ message: 'Error merging customers', error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// DELETE customer. Tatanggihan (409) kung may benta pa siya, para hindi mawala ang records.
+// Gamitin ang /customers/merge kung duplicate ang gustong alisin.
+router.delete('/customers/:id', async (req, res) => {
+  try {
+    const used = await pool.query('SELECT count(*)::int AS n FROM sales WHERE customer_id = $1', [req.params.id]);
+    if (used.rows[0].n > 0) {
+      return res.status(409).json({ message: 'Customer has sales; merge instead of deleting', sales: used.rows[0].n });
+    }
+    const result = await pool.query('DELETE FROM customers WHERE id = $1', [req.params.id]);
+    if (result.rowCount === 0) {
+      return res.status(404).json({ message: 'Customer not found' });
+    }
+    res.json({ deleted: req.params.id });
+  } catch (err) {
+    res.status(500).json({ message: 'Error deleting customer', error: err.message });
+  }
+});
+
 /* ---------------- SALES ---------------- */
 
 // Kasama na ang customer_name at customer_phone mula sa customers table (LEFT JOIN).
@@ -175,16 +307,48 @@ router.get('/sales/:id', async (req, res) => {
 
 // POST new sale — matches the POS's real sale shape (id, dateIso, staffId,
 // staffName, customerId, serviceIds[], productLines[], totals, commission, etc.)
+//
+// LAYUNIN: ang bawat matagumpay na bayad ay dapat MAI-RECORD. Kaya:
+//  - walang pagsusuri sa format ng phone/email ng customer dito (wala namang kinalaman ang benta doon)
+//  - ang mga numero ay nililinis (blangko/NaN -> null) para hindi mabasag ng maling halaga ang INSERT
+//  - ang maling petsa ay papalitan ng kasalukuyang oras sa halip na itapon ang benta
+//  - idempotent: kapag naipadala ulit ang parehong sale id, hindi ito magdodoble at hindi mag-e-error
+//  - kapag talagang pumalya, isinusulat ang buong payload sa failed-sales.log para mabawi
+const fs = require('fs');
+const path = require('path');
+const FAILED_LOG = path.join(__dirname, '..', 'failed-sales.log');
+const num = (v) => {
+  if (v === null || v === undefined || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+};
+function logFailedSale(reason, body) {
+  try {
+    fs.appendFileSync(FAILED_LOG, JSON.stringify({ at: new Date().toISOString(), reason, body }) + '\n');
+  } catch (_) { /* huwag hayaang pumalya ang request dahil sa log */ }
+  console.error('SALE NOT SAVED:', reason, '| id:', body && body.id);
+}
+
 router.post('/sales', async (req, res) => {
+  const body = req.body || {};
   try {
     const {
       id, dateIso, staffId, staffName, customerId,
       serviceIds, productLines, discountPercent,
       manualTotal, subtotal, total, commissionAmount, paymentMethod,
-    } = req.body;
+    } = body;
 
-    if (!id || !dateIso || !total) {
-      return res.status(400).json({ message: 'id, dateIso, and total are required' });
+    const totalNum = num(total);
+    if (!id || totalNum === null) {
+      logFailedSale('missing id or invalid total', body);
+      return res.status(400).json({ message: 'id and a numeric total are required' });
+    }
+    const when = dateIso && !Number.isNaN(new Date(dateIso).getTime()) ? dateIso : new Date().toISOString();
+
+    // Naipadala na ba dati ang sale na ito? Ayos lang, hindi ido-doble.
+    const already = await pool.query('SELECT * FROM sales WHERE id = $1', [id]);
+    if (already.rows.length > 0) {
+      return res.status(200).json({ ...already.rows[0], alreadyRecorded: true });
     }
 
     // Siguraduhing may row sa customers para sa customerId (hindi nito
@@ -201,17 +365,38 @@ router.post('/sales', async (req, res) => {
         (id, date_iso, staff_id, staff_name, customer_id, service_ids, product_lines,
          discount_percent, manual_total, subtotal, total, commission_amount, payment_method)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+       ON CONFLICT (id) DO NOTHING
        RETURNING *`,
       [
-        id, dateIso, staffId, staffName, customerId,
-        serviceIds, productLines ? JSON.stringify(productLines) : null,
-        discountPercent, manualTotal, subtotal, total, commissionAmount, paymentMethod,
+        id, when, staffId || null, staffName || null, customerId || null,
+        Array.isArray(serviceIds) ? serviceIds.map(String) : [],
+        JSON.stringify(Array.isArray(productLines) ? productLines : []),
+        num(discountPercent), num(manualTotal), num(subtotal), totalNum,
+        num(commissionAmount), paymentMethod || null,
       ]
     );
 
+    if (result.rows.length === 0) {
+      // Naunahan ng ibang request na may parehong id — nasa database na rin ito.
+      return res.status(200).json({ id, alreadyRecorded: true });
+    }
     res.status(201).json(result.rows[0]);
   } catch (err) {
+    logFailedSale(err.message, body);
     res.status(500).json({ message: 'Error creating sale', error: err.message });
+  }
+});
+
+// DELETE sale (kapag na-void ng owner sa POS). Hindi ginagalaw ang customer.
+router.delete('/sales/:id', async (req, res) => {
+  try {
+    const result = await pool.query('DELETE FROM sales WHERE id = $1', [req.params.id]);
+    if (result.rowCount === 0) {
+      return res.status(404).json({ message: 'Sale not found' });
+    }
+    res.json({ deleted: req.params.id });
+  } catch (err) {
+    res.status(500).json({ message: 'Error deleting sale', error: err.message });
   }
 });
 
