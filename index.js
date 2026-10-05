@@ -2,38 +2,60 @@ require('dotenv').config();
 const mongoose = require('mongoose');
 const express = require('express');
 const cors = require('cors');
+const requireApiKey = require('./middleware/apiKey');
+
 const app = express();
 
-app.use(cors());
+// ---------- CORS: mga website lang na pinapayagan ----------
+// Dagdag na domain? I-set ang CORS_ORIGINS sa host, hiwalay ng kuwit.
+const DEFAULT_ORIGINS = [
+  'https://exquisite-moonbeam-76eac3.netlify.app', // POS (Netlify)
+  'https://crosscutsalonv2.vercel.app',            // Website (Vercel)
+];
+const extraOrigins = (process.env.CORS_ORIGINS || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+const allowedOrigins = [...DEFAULT_ORIGINS, ...extraOrigins];
+const localhostPattern = /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      // Walang Origin = hindi browser (curl, Postman, server-to-server): pinapayagan
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.includes(origin) || localhostPattern.test(origin)) {
+        return callback(null, true);
+      }
+      // Hindi pinapayagan: walang CORS header, kaya haharangin ng browser
+      return callback(null, false);
+    },
+  })
+);
 app.use(express.json());
 
-const PORT = 3000;
-
-// I-connect sa MongoDB
-mongoose.connect(process.env.MONGO_URI)
-  .then(() => console.log('Connected to MongoDB!'))
-  .catch((err) => console.error('MongoDB connection error:', err));
-
-// I-connect sa Postgres (POS)
-const pgPool = require('./db/pg');
-pgPool.query('SELECT NOW()')
-  .then(() => console.log('Connected to Supabase Postgres!'))
-  .catch((err) => console.error('Postgres connection error:', err));
+const PORT = process.env.PORT || 3000;
 
 // Totoong services at staff data mula sa /data folder
 const services = require('./data/services');
 const staff = require('./data/staff');
 const Booking = require('./models/Booking');
 
-// POS routes (Postgres)
+// ---------- Health check (bukas, walang key) ----------
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', uptime: Math.round(process.uptime()) });
+});
+
+// ---------- POS routes (Postgres) - PROTEKTADO ng API key ----------
 const posRoutes = require('./routes/pos');
-app.use('/pos', posRoutes);
+app.use('/pos', requireApiKey, posRoutes);
 
 // GET home route
 app.get('/', (req, res) => {
   res.send('Welcome to CrossCut Salon API');
 });
 
+// ---------- Public: para sa website ----------
 // GET all services
 app.get('/services', (req, res) => {
   res.json(services);
@@ -62,8 +84,14 @@ app.get('/staff/:id', (req, res) => {
   res.json(member);
 });
 
+// ---------- Bookings ----------
+// POST ay PUBLIC dahil ito ang booking form ng website.
+// GET, PUT, DELETE ay PROTEKTADO: kapag public ang server, ang GET /bookings
+// ay magpapakita ng pangalan at phone ng customers, at ang DELETE ay
+// makakabura ng booking ng kahit sino.
+
 // GET all bookings
-app.get('/bookings', async (req, res) => {
+app.get('/bookings', requireApiKey, async (req, res) => {
   try {
     const bookings = await Booking.find();
     res.json(bookings);
@@ -91,7 +119,7 @@ app.post('/bookings', async (req, res) => {
 });
 
 // PUT route - i-update ang existing booking
-app.put('/bookings/:id', async (req, res) => {
+app.put('/bookings/:id', requireApiKey, async (req, res) => {
   try {
     const { name, phone, service, date, time } = req.body;
 
@@ -115,7 +143,7 @@ app.put('/bookings/:id', async (req, res) => {
 });
 
 // DELETE route - tanggalin ang isang booking
-app.delete('/bookings/:id', async (req, res) => {
+app.delete('/bookings/:id', requireApiKey, async (req, res) => {
   try {
     const booking = await Booking.findByIdAndDelete(req.params.id);
 
@@ -129,7 +157,52 @@ app.delete('/bookings/:id', async (req, res) => {
   }
 });
 
-// Start the server
-app.listen(PORT, () => {
-  console.log(`Server is running on http://localhost:${PORT}`);
+// ---------- Error handler (JSON, hindi HTML na may stack trace) ----------
+app.use((err, req, res, next) => {
+  if (err && err.type === 'entity.parse.failed') {
+    return res.status(400).json({ message: 'Invalid JSON' });
+  }
+  console.error('Unhandled error:', err);
+  res.status(500).json({ message: 'Server error' });
 });
+
+// ---------- Pag-connect sa databases at pag-start ----------
+// Tumatakbo lang kapag "node index.js" ang ginamit (hindi kapag
+// ni-require ng testServer.js), para hindi mag-connect ang test sa DB.
+function connectDatabases() {
+  // MongoDB (website bookings)
+  if (process.env.MONGO_URI) {
+    mongoose
+      .connect(process.env.MONGO_URI)
+      .then(() => console.log('Connected to MongoDB!'))
+      .catch((err) => console.error('MongoDB connection error:', err));
+  } else {
+    console.warn('MONGO_URI ay hindi naka-set: hindi gagana ang /bookings.');
+  }
+
+  // Postgres (POS)
+  const pgPool = require('./db/pg');
+  pgPool
+    .query('SELECT NOW()')
+    .then(() => console.log('Connected to Supabase Postgres!'))
+    .catch((err) => console.error('Postgres connection error:', err));
+}
+
+if (require.main === module) {
+  // Para hindi mag-crash ang buong server dahil sa isang nakalimutang error
+  process.on('unhandledRejection', (reason) => {
+    console.error('Unhandled rejection:', reason);
+  });
+
+  connectDatabases();
+
+  if (!process.env.API_KEY) {
+    console.warn('BABALA: walang API_KEY. Lahat ng /pos request ay tatanggihan (500).');
+  }
+
+  app.listen(PORT, () => {
+    console.log(`Server is running on port ${PORT}`);
+  });
+}
+
+module.exports = app;
