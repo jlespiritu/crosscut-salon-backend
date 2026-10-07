@@ -2,6 +2,41 @@
 const express = require('express');
 const router = express.Router();
 const pool = require('../db/pg');
+const fs = require('fs');
+const path = require('path');
+
+// Google Apps Script Web App URL (I-set sa Render Environment Variables o ilagay dito)
+const GAS_URL = process.env.GAS_URL || 'https://script.google.com/macros/s/AKfycbyogtSruQtvKXOGO6JoFL048uzef_d2g2AfD9qG0IGIGMk9vcgJLsXaFSD_I7AoxhiYkA/exec';
+
+const FAILED_LOG = path.join(__dirname, '..', 'failed-sales.log');
+
+const num = (v) => {
+  if (v === null || v === undefined || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+};
+
+function logFailedSale(reason, body) {
+  try {
+    fs.appendFileSync(FAILED_LOG, JSON.stringify({ at: new Date().toISOString(), reason, body }) + '\n');
+  } catch (_) { /* huwag hayaang pumalya ang request dahil sa log */ }
+  console.error('SALE NOT SAVED:', reason, '| id:', body && body.id);
+}
+
+// Helper para magpadala ng Key-Value Blob sa iyong Google Apps Script (Storage sheet & organizeData_())
+async function syncToGoogleSheets(key, valueObj) {
+  if (!GAS_URL || GAS_URL.includes('YOUR_GOOGLE_APPS_SCRIPT')) return;
+  try {
+    const valueStr = typeof valueObj === 'string' ? valueObj : JSON.stringify(valueObj);
+    await fetch(GAS_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: key, value: valueStr })
+    });
+  } catch (err) {
+    console.error(`Google Sheets Sync Error [key: ${key}]:`, err.message);
+  }
+}
 
 /* ---------------- STAFF ---------------- */
 
@@ -83,12 +118,10 @@ router.get('/customers', async (req, res) => {
   }
 });
 
-// ---- Listahan ng posibleng DUPLICATE na customers (read-only, walang binabago) ----
-// Dapat nasa ibabaw ng '/customers/:id' para hindi mapagkamalang id ang "duplicates".
 const normName = (v) => String(v || '').toLowerCase().replace(/\s+/g, ' ').trim();
 const normPhone = (v) => {
   const d = String(v || '').replace(/\D/g, '');
-  return d.length >= 10 ? d.slice(-10) : '';   // 0917.. / 917.. / +63917.. = pareho
+  return d.length >= 10 ? d.slice(-10) : '';
 };
 
 router.get('/customers/duplicates', async (req, res) => {
@@ -131,41 +164,41 @@ router.get('/customers/:id', async (req, res) => {
   }
 });
 
-// UPSERT customer: isinusulat lang ang mga field na NAKASAMA sa request body
-// (kahit blangko = binubura). Ang field na wala sa body ay hindi ginagalaw.
+// UPSERT customer (Tinatanggap ang parehong 'name' / 'client_name' at nag-a-auto-generate ng ID kung wala)
 router.post('/customers', async (req, res) => {
   try {
     const body = req.body || {};
-    const { id } = body;
+    const id = body.id || body.customerId || 'cust_' + Math.random().toString(36).substring(2, 10);
+    
+    // Normalization para sa field names
+    const nameInput = body.name || body.client_name || body.customerName;
+    const phoneInput = body.phone || body.customerPhone;
+    const emailInput = body.email;
+    const facebookInput = body.facebook;
+    const notesInput = body.notes;
 
-    if (!id) {
-      return res.status(400).json({ message: 'id is required' });
-    }
-
-    const fields = ['name', 'phone', 'email', 'facebook', 'notes'];
-    const has = {};
-    const val = {};
-    fields.forEach((f) => {
-      has[f] = Object.prototype.hasOwnProperty.call(body, f);
-      const v = has[f] && body[f] != null ? String(body[f]).trim() : '';
-      val[f] = v === '' ? null : v;
-    });
+    const name = nameInput ? String(nameInput).trim() : null;
+    const phone = phoneInput ? String(phoneInput).trim() : null;
+    const email = emailInput ? String(emailInput).trim() : null;
+    const facebook = facebookInput ? String(facebookInput).trim() : null;
+    const notes = notesInput ? String(notesInput).trim() : null;
 
     const result = await pool.query(
       `INSERT INTO customers (id, name, phone, email, facebook, notes)
        VALUES ($1, $2, $3, $4, $5, $6)
        ON CONFLICT (id) DO UPDATE SET
-         name     = CASE WHEN $7  THEN EXCLUDED.name     ELSE customers.name     END,
-         phone    = CASE WHEN $8  THEN EXCLUDED.phone    ELSE customers.phone    END,
-         email    = CASE WHEN $9  THEN EXCLUDED.email    ELSE customers.email    END,
-         facebook = CASE WHEN $10 THEN EXCLUDED.facebook ELSE customers.facebook END,
-         notes    = CASE WHEN $11 THEN EXCLUDED.notes    ELSE customers.notes    END
+         name     = COALESCE(EXCLUDED.name, customers.name),
+         phone    = COALESCE(EXCLUDED.phone, customers.phone),
+         email    = COALESCE(EXCLUDED.email, customers.email),
+         facebook = COALESCE(EXCLUDED.facebook, customers.facebook),
+         notes    = COALESCE(EXCLUDED.notes, customers.notes)
        RETURNING *`,
-      [
-        id, val.name, val.phone, val.email, val.facebook, val.notes,
-        has.name, has.phone, has.email, has.facebook, has.notes,
-      ]
+      [id, name, phone, email, facebook, notes]
     );
+
+    // Sync sa Google Sheet under 'crosscut-customers' key
+    const allCustomers = await pool.query('SELECT * FROM customers ORDER BY name');
+    syncToGoogleSheets('crosscut-customers', allCustomers.rows);
 
     res.status(201).json(result.rows[0]);
   } catch (err) {
@@ -173,11 +206,7 @@ router.post('/customers', async (req, res) => {
   }
 });
 
-// MERGE: pagsamahin ang mga duplicate na customer sa ISANG record.
-// Body: { "keepId": "cust_...", "mergeIds": ["cust_...", "cust_..."] }
-// Lahat ng benta ng mergeIds ay ililipat sa keepId, ang blangkong field ng keepId
-// (phone, email, facebook, notes) ay pupunuan mula sa mga kopya, tapos buburahin ang mga kopya.
-// Isang transaction ito: kung may pumalya, walang mababago.
+// MERGE customers
 router.post('/customers/merge', async (req, res) => {
   const { keepId, mergeIds } = req.body || {};
   if (!keepId || !Array.isArray(mergeIds) || mergeIds.length === 0) {
@@ -188,7 +217,7 @@ router.post('/customers/merge', async (req, res) => {
     return res.status(400).json({ message: 'mergeIds must contain ids other than keepId' });
   }
 
-  const ph = ids.map((_, i) => '$' + (i + 1)).join(',');   // $1,$2,... para sa IN (...)
+  const ph = ids.map((_, i) => '$' + (i + 1)).join(',');
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -216,7 +245,7 @@ router.post('/customers/merge', async (req, res) => {
         if (donor) fill[f] = donor[f];
       }
     });
-    // Kung mas maaga ang pagkakagawa ng kopya, iyon ang gawing created_at
+
     let earliest = keep.created_at;
     dupRes.rows.forEach((d) => {
       if (d.created_at && (!earliest || new Date(d.created_at) < new Date(earliest))) earliest = d.created_at;
@@ -237,6 +266,11 @@ router.post('/customers/merge', async (req, res) => {
     const del = await client.query(`DELETE FROM customers WHERE id IN (${ph})`, ids);
 
     await client.query('COMMIT');
+
+    // Sync updated customers and sales to Google Sheets
+    const updatedCustomers = await pool.query('SELECT * FROM customers ORDER BY name');
+    syncToGoogleSheets('crosscut-customers', updatedCustomers.rows);
+
     res.json({
       kept: keepId,
       salesMoved: moved.rowCount,
@@ -251,8 +285,6 @@ router.post('/customers/merge', async (req, res) => {
   }
 });
 
-// DELETE customer. Tatanggihan (409) kung may benta pa siya, para hindi mawala ang records.
-// Gamitin ang /customers/merge kung duplicate ang gustong alisin.
 router.delete('/customers/:id', async (req, res) => {
   try {
     const used = await pool.query('SELECT count(*)::int AS n FROM sales WHERE customer_id = $1', [req.params.id]);
@@ -271,8 +303,6 @@ router.delete('/customers/:id', async (req, res) => {
 
 /* ---------------- SALES ---------------- */
 
-// Kasama na ang customer_name at customer_phone mula sa customers table (LEFT JOIN).
-// Sadyang hindi isinama dito ang email/facebook/notes.
 router.get('/sales', async (req, res) => {
   try {
     const result = await pool.query(
@@ -305,38 +335,24 @@ router.get('/sales/:id', async (req, res) => {
   }
 });
 
-// POST new sale — matches the POS's real sale shape (id, dateIso, staffId,
-// staffName, customerId, serviceIds[], productLines[], totals, commission, etc.)
-//
-// LAYUNIN: ang bawat matagumpay na bayad ay dapat MAI-RECORD. Kaya:
-//  - walang pagsusuri sa format ng phone/email ng customer dito (wala namang kinalaman ang benta doon)
-//  - ang mga numero ay nililinis (blangko/NaN -> null) para hindi mabasag ng maling halaga ang INSERT
-//  - ang maling petsa ay papalitan ng kasalukuyang oras sa halip na itapon ang benta
-//  - idempotent: kapag naipadala ulit ang parehong sale id, hindi ito magdodoble at hindi mag-e-error
-//  - kapag talagang pumalya, isinusulat ang buong payload sa failed-sales.log para mabawi
-const fs = require('fs');
-const path = require('path');
-const FAILED_LOG = path.join(__dirname, '..', 'failed-sales.log');
-const num = (v) => {
-  if (v === null || v === undefined || v === '') return null;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
-};
-function logFailedSale(reason, body) {
-  try {
-    fs.appendFileSync(FAILED_LOG, JSON.stringify({ at: new Date().toISOString(), reason, body }) + '\n');
-  } catch (_) { /* huwag hayaang pumalya ang request dahil sa log */ }
-  console.error('SALE NOT SAVED:', reason, '| id:', body && body.id);
-}
-
+// POST new sale (Normalizes payload & triggers Google Sheets sync)
 router.post('/sales', async (req, res) => {
   const body = req.body || {};
   try {
-    const {
-      id, dateIso, staffId, staffName, customerId,
-      serviceIds, productLines, discountPercent,
-      manualTotal, subtotal, total, commissionAmount, paymentMethod,
-    } = body;
+    // Normalization para sa parehong camelCase at snake_case payloads
+    const id = body.id || 'sale_' + Math.random().toString(36).substring(2, 10);
+    const dateIso = body.dateIso || body.date_iso || body.createdAt || new Date().toISOString();
+    const staffId = body.staffId || body.staff_id;
+    const staffName = body.staffName || body.staff_name;
+    const customerId = body.customerId || body.customer_id;
+    const serviceIds = body.serviceIds || body.service_ids || [];
+    const productLines = body.productLines || body.product_lines || [];
+    const discountPercent = body.discountPercent || body.discount_percent;
+    const manualTotal = body.manualTotal || body.manual_total;
+    const subtotal = body.subtotal;
+    const total = body.total || body.total_amount;
+    const commissionAmount = body.commissionAmount || body.commission_amount;
+    const paymentMethod = body.paymentMethod || body.payment_method;
 
     const totalNum = num(total);
     if (!id || totalNum === null) {
@@ -345,14 +361,11 @@ router.post('/sales', async (req, res) => {
     }
     const when = dateIso && !Number.isNaN(new Date(dateIso).getTime()) ? dateIso : new Date().toISOString();
 
-    // Naipadala na ba dati ang sale na ito? Ayos lang, hindi ido-doble.
     const already = await pool.query('SELECT * FROM sales WHERE id = $1', [id]);
     if (already.rows.length > 0) {
       return res.status(200).json({ ...already.rows[0], alreadyRecorded: true });
     }
 
-    // Siguraduhing may row sa customers para sa customerId (hindi nito
-    // ino-overwrite ang existing na data)
     if (customerId) {
       await pool.query(
         'INSERT INTO customers (id) VALUES ($1) ON CONFLICT (id) DO NOTHING',
@@ -376,24 +389,53 @@ router.post('/sales', async (req, res) => {
       ]
     );
 
-    if (result.rows.length === 0) {
-      // Naunahan ng ibang request na may parehong id — nasa database na rin ito.
-      return res.status(200).json({ id, alreadyRecorded: true });
-    }
-    res.status(201).json(result.rows[0]);
+    const savedSale = result.rows[0] || { id, alreadyRecorded: true };
+
+    // Direct background sync sa Google Apps Script Storage Sheet under 'crosscut-sales' key
+    const allSales = await pool.query(`
+      SELECT s.id, s.date_iso AS "dateISO", s.staff_name AS "staffName",
+             c.name AS "customerName", s.total, s.commission_amount AS "commissionAmount",
+             s.payment_method AS "paymentMethod"
+      FROM sales s
+      LEFT JOIN customers c ON c.id = s.customer_id
+      ORDER BY s.date_iso DESC
+    `);
+    
+    syncToGoogleSheets('crosscut-sales', allSales.rows);
+
+    res.status(201).json(savedSale);
   } catch (err) {
     logFailedSale(err.message, body);
     res.status(500).json({ message: 'Error creating sale', error: err.message });
   }
 });
 
-// DELETE sale (kapag na-void ng owner sa POS). Hindi ginagalaw ang customer.
+// BULK SYNC Endpoint (Ginagamit para i-sync ang lumang localStorage records sa Supabase + Google Sheets)
+router.post('/sync-sheets', async (req, res) => {
+  const { key, value } = req.body || {};
+  if (!key || !value) {
+    return res.status(400).json({ message: 'key and value are required' });
+  }
+
+  try {
+    await syncToGoogleSheets(key, value);
+    res.json({ ok: true, message: `Key ${key} synced to Google Sheets` });
+  } catch (err) {
+    res.status(500).json({ message: 'Error syncing to Google Sheets', error: err.message });
+  }
+});
+
 router.delete('/sales/:id', async (req, res) => {
   try {
     const result = await pool.query('DELETE FROM sales WHERE id = $1', [req.params.id]);
     if (result.rowCount === 0) {
       return res.status(404).json({ message: 'Sale not found' });
     }
+    
+    // Sync updated sales array to Google Sheets so voided sales vanish automatically
+    const remainingSales = await pool.query('SELECT * FROM sales ORDER BY date_iso DESC');
+    syncToGoogleSheets('crosscut-sales', remainingSales.rows);
+
     res.json({ deleted: req.params.id });
   } catch (err) {
     res.status(500).json({ message: 'Error deleting sale', error: err.message });
