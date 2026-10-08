@@ -36,6 +36,44 @@ function isRealDate(ymd) {
   return t.getUTCFullYear() === y && t.getUTCMonth() === m - 1 && t.getUTCDate() === d;
 }
 
+// ---------- Email notification (Resend, gumagana sa HTTPS kaya OK sa Render free) ----------
+async function sendBookingEmail(b, ref) {
+  if (!process.env.RESEND_API_KEY || !process.env.NOTIFY_EMAIL) {
+    console.warn('Email skipped: missing RESEND_API_KEY or NOTIFY_EMAIL');
+    return;
+  }
+  const esc = (s) =>
+    String(s || '-').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        from: process.env.MAIL_FROM || 'Crosscut Bookings <onboarding@resend.dev>',
+        to: [process.env.NOTIFY_EMAIL],
+        subject: `New booking: ${b.service} on ${b.date} ${b.time}`,
+        html: `
+          <h2>New booking request</h2>
+          <p><b>Reference:</b> ${esc(ref)}</p>
+          <p><b>Service:</b> ${esc(b.service)}</p>
+          <p><b>Name:</b> ${esc(b.name)}</p>
+          <p><b>Phone:</b> ${esc(b.phone)}</p>
+          <p><b>Email:</b> ${esc(b.email)}</p>
+          <p><b>Date:</b> ${esc(b.date)}</p>
+          <p><b>Time:</b> ${esc(b.time)}</p>
+          <p><b>Stylist:</b> ${esc(b.staff)}</p>
+          <p><b>Notes:</b> ${esc(b.notes)}</p>`,
+      }),
+    });
+    if (!res.ok) console.error('Email failed:', res.status, await res.text());
+  } catch (err) {
+    console.error('Email error:', err);
+  }
+}
+
 // GET /bookings/slots?date=YYYY-MM-DD
 router.get('/slots', async (req, res, next) => {
   try {
@@ -72,8 +110,8 @@ router.post('/', async (req, res, next) => {
 
     // Bot traps: pagpapanggap na successful para walang clue ang bot
     if (b.website || Number(b.elapsed) < 3000) {
-    console.warn('Bot trap triggered:', { website: b.website, elapsed: b.elapsed });
-    return res.json({ ok: true, id: 'OK' });
+      console.warn('Bot trap triggered:', { website: b.website, elapsed: b.elapsed });
+      return res.json({ ok: true, id: 'OK' });
     }
 
     const digits = phone.replace(/\D/g, '');
@@ -102,7 +140,9 @@ router.post('/', async (req, res, next) => {
 
     if (rows.length === 0) return res.status(409).json({ ok: false, error: 'SLOT_FULL' });
 
-    res.status(201).json({ ok: true, id: String(rows[0].id).slice(0, 8).toUpperCase() });
+    const ref = String(rows[0].id).slice(0, 8).toUpperCase();
+    sendBookingEmail({ name, phone, email, service, staff, date, time, notes }, ref); // hindi hinihintay
+    res.status(201).json({ ok: true, id: ref });
   } catch (err) {
     next(err);
   }
