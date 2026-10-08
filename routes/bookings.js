@@ -72,7 +72,8 @@ router.post('/', async (req, res, next) => {
 
     // Bot traps: pagpapanggap na successful para walang clue ang bot
     if (b.website || Number(b.elapsed) < 3000) {
-      return res.json({ ok: true, id: 'OK' });
+    console.warn('Bot trap triggered:', { website: b.website, elapsed: b.elapsed });
+    return res.json({ ok: true, id: 'OK' });
     }
 
     const digits = phone.replace(/\D/g, '');
