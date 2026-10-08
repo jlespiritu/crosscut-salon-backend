@@ -43,7 +43,20 @@ app.get('/health', (req, res) => {
 // ---------- POS routes (Postgres/Supabase): PROTEKTADO ng API key ----------
 const posRoutes = require('./routes/pos');
 app.use('/pos', requireApiKey, posRoutes);
+// ---------- Booking routes (public website): protektado ng hiwalay na key ----------
+function requireBookingKey(req, res, next) {
+  if (req.method === 'OPTIONS') return next();
+  if (!process.env.BOOKING_API_KEY) {
+    return res.status(500).json({ ok: false, error: 'BUSY' });
+  }
+  if (req.get('x-api-key') !== process.env.BOOKING_API_KEY) {
+    return res.status(401).json({ ok: false, error: 'UNAUTHORIZED' });
+  }
+  next();
+}
 
+const bookingRoutes = require('./routes/bookings');
+app.use('/bookings', requireBookingKey, bookingRoutes);
 // ---------- Error handler (JSON, hindi HTML na may stack trace) ----------
 app.use((err, req, res, next) => {
   if (err && err.type === 'entity.parse.failed') {
