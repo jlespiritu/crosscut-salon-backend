@@ -43,6 +43,8 @@ app.get('/health', (req, res) => {
 // ---------- POS routes (Postgres/Supabase): PROTEKTADO ng API key ----------
 const posRoutes = require('./routes/pos');
 app.use('/pos', requireApiKey, posRoutes);
+const posExtraRoutes = require('./routes/posExtra');
+app.use('/pos', requireApiKey, posExtraRoutes);
 // ---------- Booking routes (public website): protektado ng hiwalay na key ----------
 function requireBookingKey(req, res, next) {
   if (req.method === 'OPTIONS') return next();
