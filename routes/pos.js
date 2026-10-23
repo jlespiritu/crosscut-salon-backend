@@ -391,17 +391,11 @@ router.post('/sales', async (req, res) => {
 
     const savedSale = result.rows[0] || { id, alreadyRecorded: true };
 
-    // Direct background sync sa Google Apps Script Storage Sheet under 'crosscut-sales' key
-    const allSales = await pool.query(`
-      SELECT s.id, s.date_iso AS "dateISO", s.staff_name AS "staffName",
-             c.name AS "customerName", s.total, s.commission_amount AS "commissionAmount",
-             s.payment_method AS "paymentMethod"
-      FROM sales s
-      LEFT JOIN customers c ON c.id = s.customer_id
-      ORDER BY s.date_iso DESC
-    `);
-    
-    syncToGoogleSheets('crosscut-sales', allSales.rows);
+    // NOTE: Google Sheets sync removed from here on purpose (2026-10).
+    // The POS frontend is the ONLY writer to the Google Sheets backup now.
+    // Having this backend also write to the same sheet key caused a race
+    // condition where sales lost their service details and sometimes
+    // doubled. Supabase (this database) is the single source of truth.
 
     res.status(201).json(savedSale);
   } catch (err) {
