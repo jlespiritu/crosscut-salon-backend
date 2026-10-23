@@ -197,10 +197,9 @@ router.post('/customers', async (req, res) => {
     );
 
     // Sync sa Google Sheet under 'crosscut-customers' key
-    const allCustomers = await pool.query('SELECT * FROM customers ORDER BY name');
-    syncToGoogleSheets('crosscut-customers', allCustomers.rows);
+  // NOTE: Google Sheets sync removed from here on purpose — see note in POST /sales.
 
-    res.status(201).json(result.rows[0]);
+  res.status(201).json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ message: 'Error saving customer', error: err.message });
   }
@@ -426,9 +425,7 @@ router.delete('/sales/:id', async (req, res) => {
       return res.status(404).json({ message: 'Sale not found' });
     }
     
-    // Sync updated sales array to Google Sheets so voided sales vanish automatically
-    const remainingSales = await pool.query('SELECT * FROM sales ORDER BY date_iso DESC');
-    syncToGoogleSheets('crosscut-sales', remainingSales.rows);
+    // NOTE: Google Sheets sync removed from here too — see note in POST /sales above.
 
     res.json({ deleted: req.params.id });
   } catch (err) {
