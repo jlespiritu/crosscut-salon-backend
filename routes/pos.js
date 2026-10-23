@@ -61,6 +61,55 @@ router.get('/staff/:id', async (req, res) => {
   }
 });
 
+// UPSERT staff (create new, or update existing by id)
+router.post('/staff', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const id = body.id || 'st_' + Math.random().toString(36).substring(2, 10);
+    const name = body.name ? String(body.name).trim() : null;
+    const role = body.role ? String(body.role).trim() : null;
+    const pinHash = body.pinHash || body.pin_hash || null;
+    const commissionRate = num(body.commissionRate ?? body.commission_rate) ?? 40;
+    const payType = (body.payType || body.pay_type) === 'daily' ? 'daily' : 'commission';
+    const active = body.active !== undefined ? !!body.active : true;
+
+    if (!name) {
+      return res.status(400).json({ message: 'name is required' });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO staff (id, name, role, pin_hash, commission_rate, pay_type, active, updated_at)
+       VALUES ($1,$2,$3,COALESCE($4, ''),$5,$6,$7, now() at time zone 'Asia/Manila')
+       ON CONFLICT (id) DO UPDATE SET
+         name = COALESCE(EXCLUDED.name, staff.name),
+         role = COALESCE(EXCLUDED.role, staff.role),
+         pin_hash = CASE WHEN EXCLUDED.pin_hash <> '' THEN EXCLUDED.pin_hash ELSE staff.pin_hash END,
+         commission_rate = EXCLUDED.commission_rate,
+         pay_type = EXCLUDED.pay_type,
+         active = EXCLUDED.active,
+         updated_at = now() at time zone 'Asia/Manila'
+       RETURNING *`,
+      [id, name, role, pinHash, commissionRate, payType, active]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ message: 'Error saving staff', error: err.message });
+  }
+});
+
+router.delete('/staff/:id', async (req, res) => {
+  try {
+    const result = await pool.query('DELETE FROM staff WHERE id = $1', [req.params.id]);
+    if (result.rowCount === 0) {
+      return res.status(404).json({ message: 'Staff not found' });
+    }
+    res.json({ deleted: req.params.id });
+  } catch (err) {
+    res.status(500).json({ message: 'Error deleting staff', error: err.message });
+  }
+});
+
 /* ---------------- SERVICES ---------------- */
 
 router.get('/services', async (req, res) => {
@@ -83,6 +132,54 @@ router.get('/services/:id', async (req, res) => {
     res.status(500).json({ message: 'Error fetching service', error: err.message });
   }
 });
+
+// UPSERT service (create new, or update existing by id)
+router.post('/services', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const id = body.id || 'svc_' + Math.random().toString(36).substring(2, 10);
+    const name = body.name ? String(body.name).trim() : null;
+    const category = body.category ? String(body.category).trim() : null;
+    const price = num(body.price) ?? 0;
+    const duration = num(body.duration) ?? 30;
+    const commissionOverride = body.commissionOverride === '' || body.commissionOverride == null
+      ? null : num(body.commissionOverride);
+
+    if (!name) {
+      return res.status(400).json({ message: 'name is required' });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO services (id, name, category, price, duration, commission_override)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       ON CONFLICT (id) DO UPDATE SET
+         name = EXCLUDED.name,
+         category = EXCLUDED.category,
+         price = EXCLUDED.price,
+         duration = EXCLUDED.duration,
+         commission_override = EXCLUDED.commission_override
+       RETURNING *`,
+      [id, name, category, price, duration, commissionOverride]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ message: 'Error saving service', error: err.message });
+  }
+});
+
+router.delete('/services/:id', async (req, res) => {
+  try {
+    const result = await pool.query('DELETE FROM services WHERE id = $1', [req.params.id]);
+    if (result.rowCount === 0) {
+      return res.status(404).json({ message: 'Service not found' });
+    }
+    res.json({ deleted: req.params.id });
+  } catch (err) {
+    res.status(500).json({ message: 'Error deleting service', error: err.message });
+  }
+});
+
 
 /* ---------------- PRODUCTS ---------------- */
 
@@ -266,9 +363,7 @@ router.post('/customers/merge', async (req, res) => {
 
     await client.query('COMMIT');
 
-    // Sync updated customers and sales to Google Sheets
-    const updatedCustomers = await pool.query('SELECT * FROM customers ORDER BY name');
-    syncToGoogleSheets('crosscut-customers', updatedCustomers.rows);
+    // Sync updated customers and sales to Google Sheet
 
     res.json({
       kept: keepId,
@@ -360,7 +455,7 @@ router.post('/sales', async (req, res) => {
     }
     const when = dateIso && !Number.isNaN(new Date(dateIso).getTime()) ? dateIso : new Date().toISOString();
 
-    const already = await pool.query('SELECT * FROM sales WHERE id = $1', [id]);
+        const already = await pool.query('SELECT * FROM sales WHERE id = $1', [id]);
     if (already.rows.length > 0) {
       return res.status(200).json({ ...already.rows[0], alreadyRecorded: true });
     }
